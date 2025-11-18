@@ -11,7 +11,7 @@ if not BOT_TOKEN:
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-SECRET = os.getenv("SECRET")
+SECRET = os.getenv("SECRET", "repost-secret-123")
 
 REDIS_URL = os.getenv("REDIS_URL")
 if not REDIS_URL:
@@ -36,7 +36,6 @@ def send_message(chat_id, text):
             timeout=5
         )
     except Exception as e:
-        # לא נפל על זה – פשוט מדלגים
         print("send_message error:", e)
 
 
@@ -59,7 +58,7 @@ def forward_message(target_chat_id, from_chat_id, message_id):
 
 def save_group(chat_id: int, title: str):
     """
-    שומר/מעדכן קבוצה ברשימת הקבוצות שהבוט מכיר.
+    שומר/מעדכן קבוצה/ערוץ ברשימת הקבוצות שהבוט מכיר.
     """
     redis_client.hset("repost:known_groups", str(chat_id), title)
 
@@ -127,6 +126,7 @@ def get_all_targets():
 def find_targets_for_source(source_chat_id: int):
     """
     מחזיר רשימת כל היעדים שקבעו את source_chat_id כמקור.
+    (המקור כאן הוא קבוצת הדיונים – לא הערוץ עצמו)
     """
     source_str = str(source_chat_id)
     targets = []
@@ -150,7 +150,7 @@ def build_sources_list_for_target(target_chat_id: int):
 
     items = []
     for chat_id_str, title in all_groups.items():
-        # לא להציג את קבוצת היעד עצמה כמקור (אלא אם אתה רוצה)
+        # לא להציג את קבוצת היעד עצמה כמקור
         if chat_id_str == str(target_chat_id):
             continue
         is_active = chat_id_str in active_sources
@@ -170,13 +170,13 @@ def build_sources_list_for_target(target_chat_id: int):
 
 @app.route(f"/{SECRET}", methods=["POST"])
 def webhook():
+    # תומך גם ב-message וגם ב-channel_post (למקרה של ערוץ שהבוט בתוכו)
     update = request.get_json(force=True, silent=True)
     if not update:
         return jsonify(ok=True)
 
-    message = update.get("message")
+    message = update.get("message") or update.get("channel_post")
     if not message:
-        # אפשר להוסיף תמיכה ב-edited_message אם תרצה
         return jsonify(ok=True)
 
     chat = message.get("chat", {})
@@ -186,18 +186,32 @@ def webhook():
     user_id = from_user.get("id")
     text = message.get("text", "")
 
+    # מידע על מי ששלח – יכול להיות ערוץ בתוך קבוצת דיונים
+    sender_chat = message.get("sender_chat")
+    is_from_channel_in_group = bool(sender_chat and sender_chat.get("type") == "channel")
+
     # ===== שמירת קבוצות שהבוט מכיר =====
     if chat_type in ("group", "supergroup", "channel"):
         title = chat.get("title", f"chat_{chat_id}")
         save_group(chat_id, title)
 
-    # ===== אוטו forward מקבוצות מקור ליעדים =====
-    # (לא נוגעים בהודעות פרטיות)
-    if chat_type in ("group", "supergroup", "channel"):
+    # ===== אוטו forward מקבוצות דיון ליעדים =====
+    #
+    # כאן נכנס הטריק:
+    # אנחנו מתייחסים רק להודעות שמגיעות מ-group/supergroup
+    # ורק אם הן נשלחו "מטעם ערוץ" (sender_chat.type == "channel").
+    #
+    if chat_type in ("group", "supergroup") and "message_id" in message:
+        # אלה קבוצות (כולל קבוצות דיון) שהוגדרו כמקורות
         targets = find_targets_for_source(chat_id)
-        if targets and "message_id" in message:
+
+        # אם אין יעדים – אין מה לעשות
+        if targets:
+            # אם זו לא הודעה של ערוץ בתוך קבוצת הדיון – לא מעבירים
+            if not is_from_channel_in_group:
+                return jsonify(ok=True)
+
             for target_chat_id in targets:
-                # לא ליצור לופ על אותו chat
                 if target_chat_id == chat_id:
                     continue
                 forward_message(
@@ -205,6 +219,18 @@ def webhook():
                     from_chat_id=chat_id,
                     message_id=message["message_id"],
                 )
+
+    # (אופציונלי) אם תרצה גם לתמוך בערוץ שהבוט אדמין בו ישירות:
+    # if chat_type == "channel" and "message_id" in message:
+    #     targets = find_targets_for_source(chat_id)
+    #     for target_chat_id in targets:
+    #         if target_chat_id == chat_id:
+    #             continue
+    #         forward_message(
+    #             target_chat_id=target_chat_id,
+    #             from_chat_id=chat_id,
+    #             message_id=message["message_id"],
+    #         )
 
     # ===== פקודת \repost / /repost בקבוצת יעד =====
     if chat_type in ("group", "supergroup") and user_id and text in ("\\repost", "/repost"):
@@ -220,9 +246,10 @@ def webhook():
         if not items:
             send_message(
                 user_id,
-                f"לא מצאתי קבוצות אחרות שהבוט מכיר.\n"
-                f"תצרף את הבוט לקבוצות נוספות, תכתוב שם הודעה אחת לפחות,\n"
-                f"ואז תחזור לכאן ותשלח שוב \\repost."
+                "לא מצאתי קבוצות אחרות שהבוט מכיר.\n"
+                "תצרף את הבוט לקבוצות נוספות (למשל קבוצות דיון של ערוצים), "
+                "תכתוב שם הודעה אחת לפחות,\n"
+                "ואז תחזור לכאן ותשלח שוב \\repost."
             )
             return jsonify(ok=True)
 
@@ -236,7 +263,7 @@ def webhook():
             lines.append(f"{i}. {prefix} {title}")
 
         lines.append("")
-        lines.append("שלח מספר כדי להפעיל/לבטל קבוצה כמקור עבור הקבוצה הזאת.")
+        lines.append("שלח מספר כדי להפעיל/לבטל קבוצה כמקור עבור הקבוצה הזאת (קבוצת היעד).")
 
         send_message(user_id, "\n".join(lines))
 
@@ -245,11 +272,12 @@ def webhook():
     # ===== טיפול בהודעות פרטיות – בחירת מספר =====
     if chat_type == "private" and user_id in PENDING_TARGET and text:
         target_chat_id = PENDING_TARGET[user_id]
-        target_title = redis_client.hget("repost:known_groups", str(target_chat_id)) or f"chat_{target_chat_id}"
+        all_groups = get_all_groups()
+        target_title = all_groups.get(str(target_chat_id), f"chat_{target_chat_id}")
 
         choices = USER_GROUP_CHOICES.get(user_id)
         if not choices:
-            # נבנה מחדש (במקרה והסטייט בזיכרון אבד) – לא חובה, אבל יפה
+            # במקרה והסטייט בזיכרון נפל – נבנה מחדש מהרשימה
             items = build_sources_list_for_target(target_chat_id)
             if not items:
                 send_message(user_id, "אין לי כרגע רשימת קבוצות לעבודה. תנסה שוב \\repost בקבוצת היעד.")
@@ -271,7 +299,6 @@ def webhook():
 
         source_chat_id = choices[idx - 1]
 
-        # נביא שם קבוצה
         all_groups = get_all_groups()
         source_title = all_groups.get(str(source_chat_id), f"chat_{source_chat_id}")
 
@@ -288,7 +315,7 @@ def webhook():
                 f"הקבוצה '{source_title}' הוסרה מרשימת המקורות של '{target_title}'."
             )
 
-        # בונים מחדש רשימה מעודכנת ומחזירים לו
+        # בונים מחדש רשימה מעודכנת ומחזירים לך
         items = build_sources_list_for_target(target_chat_id)
         USER_GROUP_CHOICES[user_id] = [cid for (cid, _title, _active) in items]
 
@@ -308,5 +335,5 @@ def webhook():
 
 
 if __name__ == "__main__":
-    # להרצה לוקאלית – ברנדר לא משתמש בזה, יש לו gunicorn משלו
+    # להרצה לוקאלית – ברנדר משתמש ב-gunicorn
     app.run(host="0.0.0.0", port=8000)
