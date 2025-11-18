@@ -232,7 +232,7 @@ def webhook():
         # בונה טקסט רשימה
         lines = [f"קבוצות מקור עבור: {target_title}", ""]
         for i, (cid, title, is_active) in enumerate(items, start=1):
-            prefix = "✅" אם is_active else "⬜️"
+            prefix = "✅" if is_active else "⬜️"
             lines.append(f"{i}. {prefix} {title}")
 
         lines.append("")
